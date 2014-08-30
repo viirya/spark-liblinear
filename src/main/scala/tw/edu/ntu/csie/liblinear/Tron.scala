@@ -2,6 +2,8 @@ package tw.edu.ntu.csie.liblinear
 
 import scala.math.exp
 import scala.util.control.Breaks._
+import scala.collection.{Map => Map}
+
 import org.apache.spark.SparkContext._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
@@ -14,11 +16,11 @@ import tw.edu.ntu.csie.liblinear.rdd.RDDFunctions._
 abstract class TronFunction
 {
 
-	def functionValue(dataPoints: RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter) : Double
+	def functionValue(dataPoints: RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter, cwf_broad: Broadcast[Map[Int, Array[Double]]]) : Double
 
-	def gradient(dataPoints : RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter) : DoubleMatrix
+	def gradient(dataPoints : RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter, cwf_broad: Broadcast[Map[Int, Array[Double]]]) : DoubleMatrix
 	
-	def hessianVector(dataPoints : RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter, s : DoubleMatrix) : DoubleMatrix
+	def hessianVector(dataPoints : RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter, s : DoubleMatrix, cwf_broad: Broadcast[Map[Int, Array[Double]]]) : DoubleMatrix
 }
 
 /**
@@ -27,12 +29,13 @@ abstract class TronFunction
 class TronLR extends TronFunction
 {
 
-	override def functionValue(dataPoints: RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter) : Double =
+	override def functionValue(dataPoints: RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter, cwf_broad: Broadcast[Map[Int, Array[Double]]]) : Double =
 	{
 		val C = param.C
-		val f = dataPoints.mapPartitions(blocks => {
+		val f = dataPoints.mapPartitionsWithIndex((p_i, blocks) => {
 			val wB = w_broad.value
 			var f_obj : Double = 0.0
+            var z_array = Array[Double]()
 			while(blocks.hasNext)
 			{
 				var p = blocks.next()
@@ -45,6 +48,7 @@ class TronLR extends TronFunction
 				}
 				var yz = p.y * z
 				var enyz = exp(-yz)
+                z_array = z_array :+ enyz
 				if(yz >= 0)
 				{
 					f_obj += math.log(1+enyz)
@@ -54,64 +58,61 @@ class TronLR extends TronFunction
 					f_obj += -yz + math.log(1+exp(yz))
 				}
 			}
+            cwf_broad.setValue((v) => v + (p_i -> z_array))
 			Seq(f_obj).iterator
 		}).reduce(_ + _) * C + (0.5 * w_broad.value.dot(w_broad.value))
 		f
 	}
 
-	override def gradient(dataPoints : RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter) : DoubleMatrix =
+	override def gradient(dataPoints : RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter, cwf_broad: Broadcast[Map[Int, Array[Double]]]) : DoubleMatrix =
 	{
 		val C = param.C
-		val g = dataPoints.mapPartitions(blocks => {
+		val g = dataPoints.mapPartitionsWithIndex((p_i, blocks) => {
 			val wB = w_broad.value
 			val n = wB.length
 			var grad = Array.fill(n)(0.0)
+            val z_array = cwf_broad.value
+            var index = 0
 			while(blocks.hasNext)
 			{
 				var p = blocks.next()
-				var z = 0.0
 				var i = 0
-				while(i < p.index.length)
-				{
-					z += p.value(i) * wB.get(p.index(i))
-					i += 1
-				}
-				z = (1.0 / (1.0 + exp(-p.y * z)) - 1.0) * p.y
-				i = 0
+				var z = (1.0 / (1.0 + z_array(p_i)(index)) - 1.0) * p.y
 				while(i < p.index.length)
 				{
 					grad(p.index(i)) += z * p.value(i)
 					i += 1
 				}
+                index += 1
 			}
 			Seq(new DoubleMatrix(grad)).iterator
 		}).slaveReduce(_.addi(_), param.numSlaves).muli(C).addi(w_broad.value)
 		g
 	}
 
-	override def hessianVector(dataPoints : RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter, s : DoubleMatrix) : DoubleMatrix =
+	override def hessianVector(dataPoints : RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter, s : DoubleMatrix, cwf_broad: Broadcast[Map[Int, Array[Double]]]) : DoubleMatrix =
 	{
 		val C = param.C
 		val sc = dataPoints.sparkContext
 		val s_broad = sc.broadcast(s)
-		val Hs = dataPoints.mapPartitions(blocks => {
+		val Hs = dataPoints.mapPartitionsWithIndex((p_i, blocks) => {
 			val wB = w_broad.value
 			val sB = s_broad.value
 			val n = wB.length
 			var blockHs = Array.fill(n)(0.0)
+            val z_array = cwf_broad.value
+            var index = 0 
 			while(blocks.hasNext)
 			{
 				var p = blocks.next()
-				var z = 0.0
 				var wa = 0.0 
 				var i = 0
 				while(i < p.index.length)
 				{
-					z += p.value(i) * wB.get(p.index(i))
 					wa += p.value(i) * sB.get(p.index(i))
 					i += 1
 				}   
-				val sigma = 1.0 / (1.0 + exp(-p.y * z))
+				val sigma = 1.0 / (1.0 + z_array(p_i)(index))
 				val D = sigma * (1.0 - sigma)
 				wa = D * wa
 				i = 0
@@ -120,6 +121,7 @@ class TronLR extends TronFunction
 					blockHs(p.index(i)) += wa * p.value(i)
 					i += 1
 				}
+                index += 1
 			}
 			Seq(new DoubleMatrix(blockHs)).iterator
 		}).slaveReduce(_.addi(_), param.numSlaves).muli(C).addi(s)
@@ -134,12 +136,13 @@ class TronLR extends TronFunction
 class TronL2SVM extends TronFunction
 {
 
-	override def functionValue(dataPoints: RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter) : Double =
+	override def functionValue(dataPoints: RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter, cwf_broad: Broadcast[Map[Int, Array[Double]]]) : Double =
 	{
 		val C = param.C
-		val f = dataPoints.mapPartitions(blocks => {
+		val f = dataPoints.mapPartitionsWithIndex((p_i, blocks) => {
 			val wB = w_broad.value
 			var f_obj : Double = 0.0
+            var z_array = Array[Double]()
 			while(blocks.hasNext)
 			{
 				var p = blocks.next()
@@ -150,35 +153,34 @@ class TronL2SVM extends TronFunction
 					z += p.value(i) * wB.get(p.index(i))
 					i += 1
 				}
-				val d = 1 - p.y * z
+                val pyz = p.y * z
+                z_array = z_array :+ pyz
+				val d = 1 - pyz
 				if (d > 0)
 				{
 					f_obj += d * d;
 				}
 			}
+            cwf_broad.setValue((v) => v + (p_i -> z_array))
 			Seq(f_obj).iterator
 		}).reduce(_ + _) * C + (0.5 * w_broad.value.dot(w_broad.value))
 		f
 	}
 
-	override def gradient(dataPoints : RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter) : DoubleMatrix =
+	override def gradient(dataPoints : RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter, cwf_broad: Broadcast[Map[Int, Array[Double]]]) : DoubleMatrix =
 	{
 		val C = param.C
-		val g = dataPoints.mapPartitions(blocks => {
+		val g = dataPoints.mapPartitionsWithIndex((p_i, blocks) => {
 			val wB = w_broad.value
 			val n = wB.length
 			var grad = Array.fill(n)(0.0)
+            val z_array = cwf_broad.value
+            var index = 0
 			while(blocks.hasNext)
 			{
 				var p = blocks.next()
-				var z = 0.0
 				var i = 0
-				while(i < p.index.length)
-				{
-					z += p.value(i) * wB.get(p.index(i))
-					i += 1
-				}
-				z = p.y * z
+				var z = z_array(p_i)(index)
 				if(z < 1)
 				{
 					z = p.y * (z-1)
@@ -189,33 +191,30 @@ class TronL2SVM extends TronFunction
 						i += 1
 					}
 				}
+                index += 1
 			}
 			Seq(new DoubleMatrix(grad)).iterator
 		}).slaveReduce(_.addi(_), param.numSlaves).muli(2*C).addi(w_broad.value)
 		g
 	}
 
-	override def hessianVector(dataPoints : RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter, s : DoubleMatrix) : DoubleMatrix =
+	override def hessianVector(dataPoints : RDD[DataPoint], w_broad : Broadcast[DoubleMatrix], param : Parameter, s : DoubleMatrix, cwf_broad: Broadcast[Map[Int, Array[Double]]]) : DoubleMatrix =
 	{
 		val C = param.C
 		val sc = dataPoints.sparkContext
 		val s_broad = sc.broadcast(s)
-		val Hs = dataPoints.mapPartitions(blocks => {
+		val Hs = dataPoints.mapPartitionsWithIndex((p_i, blocks) => {
 			val wB = w_broad.value
 			val sB = s_broad.value
 			val n = wB.length
 			var blockHs = Array.fill(n)(0.0)
+            val z_array = cwf_broad.value
+            var index = 0
 			while(blocks.hasNext)
 			{
 				var p = blocks.next()
-				var z = 0.0
 				var i = 0
-				while(i < p.index.length)
-				{
-					z += p.value(i) * wB.get(p.index(i))
-					i += 1
-				}
-				if(p.y * z < 1)
+				if(z_array(p_i)(index) < 1)
 				{
 					var wa = 0.0
 					i = 0
@@ -231,6 +230,7 @@ class TronL2SVM extends TronFunction
 						i += 1
 					}
 				}
+                index += 1
 			}
 			Seq(new DoubleMatrix(blockHs)).iterator
 		}).slaveReduce(_.addi(_), param.numSlaves).muli(2*C).addi(s)
@@ -247,7 +247,7 @@ class TronL2SVM extends TronFunction
 class Tron(val function : TronFunction)
 {
 
-	private def trcg(dataPoints : RDD[DataPoint], param : Parameter, delta : Double,  w_broad : Broadcast[DoubleMatrix], g : DoubleMatrix) : (Int, DoubleMatrix, DoubleMatrix) = 
+	private def trcg(dataPoints : RDD[DataPoint], param : Parameter, delta : Double,  w_broad : Broadcast[DoubleMatrix], g : DoubleMatrix, cwf_broad: Broadcast[Map[Int, Array[Double]]]) : (Int, DoubleMatrix, DoubleMatrix) = 
 	{
 		val n = w_broad.value.length
 		var s = DoubleMatrix.zeros(n)
@@ -268,7 +268,7 @@ class Tron(val function : TronFunction)
 			cgIter += 1
 
 			/* hessianVector */
-			var Hd = function.hessianVector(dataPoints, w_broad, param, d)
+			var Hd = function.hessianVector(dataPoints, w_broad, param, d, cwf_broad)
 			var alpha = rTr / d.dot(Hd)
 			s.addi(d.mul(alpha))
 			if(s.norm2() > delta)
@@ -324,13 +324,17 @@ class Tron(val function : TronFunction)
 		var w_new : DoubleMatrix = null
 		var dataPoints = prob.dataPoints
 
+        var cwf = Map[Int, Array[Double]]()
+
 		val sc = dataPoints.sparkContext
 		var w_broad = sc.broadcast(w)
+        var cwf_bc = sc.broadcast(cwf)
+ 
 	   	/* Function Value*/
-		f = function.functionValue(dataPoints, w_broad, param)
+		f = function.functionValue(dataPoints, w_broad, param, cwf_bc)
 
 		/* gradient */
-		var g = function.gradient(dataPoints, w_broad, param)
+		var g = function.gradient(dataPoints, w_broad, param, cwf_bc)
 		delta = g.norm2()
 		var gnorm1 = delta
 		var gnorm = gnorm1
@@ -342,14 +346,14 @@ class Tron(val function : TronFunction)
 		breakable {
 		while(iter <= ITERATIONS && search == 1)
 		{
-			var (cgIter, s, r) = trcg(dataPoints, param, delta, w_broad, g)
+			var (cgIter, s, r) = trcg(dataPoints, param, delta, w_broad, g, cwf_bc)
 			w_new = w.add(s)
 			gs = g.dot(s)
 			prered = -0.5*(gs - s.dot(r))
 			w_broad.unpersist()
 			w_broad = sc.broadcast(w_new)
 			/* Function value */
-			fnew = function.functionValue(dataPoints, w_broad, param)
+			fnew = function.functionValue(dataPoints, w_broad, param, cwf_bc)
 
 			/* Compute the actual reduction. */
 			actred = f - fnew
@@ -397,7 +401,7 @@ class Tron(val function : TronFunction)
 				w = w_new
 				f = fnew
 				/* gradient */
-				g = function.gradient(dataPoints, w_broad, param)
+				g = function.gradient(dataPoints, w_broad, param, cwf_bc)
 
 				gnorm = g.norm2()
 				if (gnorm <= eps*gnorm1)
