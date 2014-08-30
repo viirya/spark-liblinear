@@ -1,0 +1,86 @@
+This extension of LIBLINEAR supports distributed training for the following two solvers:
+
+	 L2-regularized logistic regression (primal)
+	 L2-regularized L2-loss support vector classification (primal)
+
+Jar
+==================
+
+The Jar of Spark LIBLIENAR in the root directory is with the dependencies:
+Scala 2.10.3 and Spark 1.0.0.
+If you would like to generate a Jar with other versions,
+you can edit the versions numbers in liblinear.sbt and use sbt to generate the Jar.
+To use sbt, you need to download sbt-lauch.jar to sbt/.
+On Unix systems, the following command is helpful to do this.
+$ wget http://repo.typesafe.com/typesafe/ivy-releases/org.scala-sbt/sbt-launch/0.13.2/sbt-launch.jar -O sbt/sbt-launch.jar
+Then you type 'sbt/sbt package' to generate the Jar.
+It will be generated in target/scala-x.xx/.
+
+Guide
+==================
+
+This extension has been tested only on Spark 1.0.0.
+We assume that:
+
+    - You are a LIBLINEAR user who is trying to run it on Spark.
+
+    - Spark has been built up in your environment. If not, please build it up.
+      You can follow the guide on the official site of Apache Spark or our 
+      guide for installing Spark on VirtualBox.
+    
+    - ``heart_scale'' is the dataset you want to train.
+
+    - SPARK_HOME is the directory where SPARK is installed.
+      LIBLINEAR_HOME is the root directory of Spark LIBLINEAR.
+
+Now see the following example to learn the usage.
+
+1.  Start Spark shell with the Jar of Spark LIBLINEAR. Step 2~5 are all in Spark shell.
+
+    $ SPARK_HOME/bin/spark-shell --jars "LIBLINEAR_HOME/spark-liblinear-1.94.jar"
+
+2.  Import the classes of Spark LIBLINEAR.
+    
+    >>> import tw.edu.ntu.csie.liblinear._
+
+3.  Load the dataset from HDFS. Note that you have to specify the master and path instead of using
+      "masterMachine" and "/path/to/heart_scale".
+
+    >>> val data = Utils.loadLibSVMData(sc, "hdfs://masterMachine:9000/path/to/heart_scale")
+
+4.  Build a model. Note that you can specify LIBLINEAR options in the second argument of train().
+
+    >>> val model = SparkLiblinear.train(data, "-s 0 -c 1.0")
+
+5.  Predict labels by predict() and compute the accuracy.
+
+    >>> val labelAndPreds = data.map { point =>
+      val prediction = model.predict(point)
+        (point.y, prediction)
+    }
+    >>> val accuracy = labelAndPreds.filter(r => r._1 == r._2).count.toDouble / data.count
+    >>> println("Training Accuracy = " + accuracy)
+
+`train' Usage
+======================
+
+Usage: model = train(trainingData, 'options')
+options:
+-s type : set type of solver (default 0)
+	0 -- L2-regularized logistic regression (primal)
+	2 -- L2-regularized L2-loss support vector classification (primal)
+-c cost : set the parameter C (default 1)
+-e epsilon : set tolerance of termination criterion
+	-s 0 and 2
+		|f'(w)|_2 <= eps*min(pos,neg)/l*|f'(w0)|_2,
+		where f is the primal function and pos/neg are # of
+		positive/negative data (default 0.01)
+-B bias : if bias >= 0, instance x becomes [x; bias]; if < 0, no bias term added (default -1)
+-N #salves : if #slaves > 0, enable the coalesce function to reduce the communication cost; if <= 0, do not use the coalesce function (default -1)
+
+Additional Information
+======================
+
+For any questions and comments, please send your email to:
+
+  cjlin@csie.ntu.edu.tw
